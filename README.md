@@ -1,5 +1,5 @@
 # 💫 About Me:
-I'm currently working on software projects<br>I'm looking to collaborate on all kinds of software projects<br> I'm looking for help with remote opportunities and freelance projects<br>I'm currently learning Cloud computing, Machine Learning, and AI<br>Ask me about any tech-related stuff<br>
+I'm currently working on software projects<br>I'm looking to collaborate on all kinds of software projects<br> I'm looking for help with remote opportunities and freelance projects<br>I'm a Certified AWS Cloud Practitioner, Machine Learning, and AI<br>Ask me about any tech-related stuff<br>
 
 
 ## 🌐 Socials:
