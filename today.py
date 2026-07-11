@@ -25,7 +25,7 @@ import os
 import glob
 import urllib.request
 import urllib.error
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -52,8 +52,13 @@ LINKEDIN = os.environ.get("LINKEDIN", "linkedin.com/in/abdulai-yorli-iddrisu")
 MEDIUM = os.environ.get("MEDIUM", "medium.com/@iddrisuabdulaiyorli1")
 
 # --- ASCII rendering config ---------------------------------------------------
-ASCII_COLS = 34
+# High resolution so the portrait is clearly recognizable as a specific face.
+ASCII_COLS = 80
 RAMP = " .:-=+*#%@"          # index 0 (dark) .. 9 (light)
+# ASCII cell metrics (small font -> the portrait reads photographically).
+AW = 5.5                     # ascii char advance (px) at 9px mono
+AH = 10.5                    # ascii line height (px)
+# Info-panel cell metrics (larger, readable text).
 CHAR_W = 8.4
 CHAR_H = 16.0
 
@@ -140,18 +145,25 @@ def fetch_stats() -> dict:
 # ASCII portrait
 # =============================================================================
 def load_and_crop(path: str) -> Image.Image:
+    """Tight head-and-shoulders crop, then enhance so facial features pop."""
     img = Image.open(path).convert("RGB")
+    img = ImageOps.exif_transpose(img)          # respect camera orientation
     w, h = img.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = int((h - side) * 0.15)
-    return img.crop((left, top, left + side, top + side))
+    # Crop to the top ~60% (head + shoulders) and trim a little off the sides
+    # so the face fills the frame -> maximum detail per character.
+    left, right = int(w * 0.06), int(w * 0.94)
+    img = img.crop((left, 0, right, int(h * 0.60)))
+    # Feature enhancement: normalize tonal range, boost contrast, sharpen edges.
+    img = ImageOps.autocontrast(img, cutoff=1)
+    img = ImageEnhance.Contrast(img).enhance(1.25)
+    img = ImageEnhance.Sharpness(img).enhance(1.6)
+    return img
 
 
 def to_ascii(img: Image.Image):
     cols = ASCII_COLS
     w, h = img.size
-    cell_aspect = CHAR_H / CHAR_W
+    cell_aspect = AH / AW
     rows = max(1, int(cols * (h / w) / cell_aspect))
     small = img.resize((cols, rows), Image.LANCZOS)
 
@@ -175,7 +187,7 @@ def to_ascii(img: Image.Image):
             lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
             norm = (lum - lo) / span                 # 0 = darkest .. 1 = lightest
             # Drop the light studio background so the portrait floats cleanly.
-            if norm > 0.80:
+            if norm > 0.85:
                 line.append((" ", "#000000"))
                 continue
             # Invert: DARK subject/suit -> dense glyphs, LIGHT bg -> blank.
@@ -188,7 +200,7 @@ def to_ascii(img: Image.Image):
 
 
 def placeholder_grid():
-    rows = 16
+    rows = int(ASCII_COLS * 0.45)
     grid = []
     for y in range(rows):
         line = []
@@ -203,12 +215,19 @@ def placeholder_grid():
 
 def ascii_to_svg(grid, x0, y0):
     out = []
+    row_w = ASCII_COLS * AW
     for i, row in enumerate(grid):
-        y = y0 + i * CHAR_H
+        y = y0 + i * AH
         spans = "".join(
             f'<tspan fill="{c}">{html.escape(ch)}</tspan>' for ch, c in row
         )
-        out.append(f'<text x="{x0:.1f}" y="{y:.1f}" class="ascii">{spans}</text>')
+        # textLength locks each row to an exact width so alignment is identical
+        # regardless of which monospace font the viewer's browser substitutes.
+        out.append(
+            f'<text x="{x0:.1f}" y="{y:.1f}" class="ascii" '
+            f'textLength="{row_w:.1f}" lengthAdjust="spacingAndGlyphs">'
+            f'{spans}</text>'
+        )
     return "\n".join(out), len(grid)
 
 
@@ -242,7 +261,8 @@ def info_lines(stats, accent, dim, text, accent2):
         [(f"Commits ({stats['year']})", A), (": ", T), (stats["commits"], G),
          ("  Following", A), (": ", T), (stats["following"], G)],
         [("", T)],
-        [("Contact", A), (": ", T), (f"{LINKEDIN} · {MEDIUM}", T)],
+        [("LinkedIn", A), (": ", T), (LINKEDIN.replace("linkedin.com/", ""), T)],
+        [("Medium", A), (": ", T), (MEDIUM.replace("medium.com/", ""), T)],
     ]
 
 
@@ -276,19 +296,27 @@ def build_svg(theme_name, grid, stats):
     pad, title_h = 24, 40
     top = title_h + 28
 
-    ascii_x = pad + 8
+    ascii_x = pad + 6
     ascii_y = top + 14
     ascii_svg, n_rows = ascii_to_svg(grid, ascii_x, ascii_y)
-    ascii_w = ASCII_COLS * CHAR_W
+    ascii_w = ASCII_COLS * AW
+    ascii_h = n_rows * AH
 
-    info_x = ascii_x + ascii_w + 34
     lines = info_lines(stats, t["accent"], t["dim"], t["text"], t["accent2"])
-    info_svg, n_info = info_to_svg(lines, info_x, ascii_y)
+    n_info = len(lines)
+    info_h = n_info * CHAR_H
+    info_x = ascii_x + ascii_w + 46
+    info_y = ascii_y + max(0.0, (ascii_h - info_h) / 2)   # center vs portrait
+    info_svg, _ = info_to_svg(lines, info_x, info_y)
+
+    max_chars = max(sum(len(s) for s, _ in segs) for segs in lines)
+    info_w = max_chars * CHAR_W
 
     header_y = top - 6
-    prompt_y = ascii_y + max(n_rows, n_info) * CHAR_H + 30
+    body_bottom = ascii_y + max(ascii_h, info_h)
+    prompt_y = body_bottom + 26
     height = int(prompt_y + 40)
-    width = max(int(info_x + CHAR_W * 42 + pad), 940)
+    width = max(int(info_x + info_w + pad), 900)
 
     typed = ("Abdulai Yorli Iddrisu — building reliable cloud "
              "& web systems from Accra.")
@@ -297,7 +325,7 @@ def build_svg(theme_name, grid, stats):
     styles = f"""
     <style>
       .mono {{ font-family:'JetBrains Mono','Fira Code','Cascadia Code','SF Mono',Consolas,monospace; }}
-      .ascii{{ font-size:13px; font-family:'JetBrains Mono','Fira Code',Consolas,monospace; }}
+      .ascii{{ font-size:9px; font-family:'JetBrains Mono','Fira Code',Consolas,monospace; }}
       .info {{ font-size:13.5px; }}
       .title{{ fill:{t['title']}; font-size:13px; }}
       .type {{ fill:{t['accent']}; font-size:15px; }}
