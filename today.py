@@ -45,20 +45,25 @@ def _find_photo():
 PHOTO = _find_photo()
 
 USER_NAME = os.environ.get("USER_NAME", "yorliabdulai")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
+# Prefer a user PAT (full contribution data); fall back to the Action's
+# built-in GITHUB_TOKEN so stats can work even without creating a PAT.
+ACCESS_TOKEN = (os.environ.get("ACCESS_TOKEN")
+                or os.environ.get("GH_TOKEN")
+                or os.environ.get("GITHUB_TOKEN") or "")
 
 # ---- personal info (edit here) ----------------------------------------------
 LINKEDIN = os.environ.get("LINKEDIN", "linkedin.com/in/abdulai-yorli-iddrisu")
 MEDIUM = os.environ.get("MEDIUM", "medium.com/@iddrisuabdulaiyorli1")
 
-# --- ASCII rendering config ---------------------------------------------------
-# High resolution so the portrait is clearly recognizable as a specific face.
-ASCII_COLS = 80
-RAMP = " .:-=+*#%@"          # index 0 (dark) .. 9 (light)
-# ASCII cell metrics (small font -> the portrait reads photographically).
-AW = 5.5                     # ascii char advance (px) at 9px mono
-AH = 10.5                    # ascii line height (px)
-# Info-panel cell metrics (larger, readable text).
+# --- Portrait config ----------------------------------------------------------
+# The portrait is rendered as deterministic colored pixels (SVG <rect>s), NOT
+# font-based ASCII. Text ASCII gets distorted by whatever monospace font the
+# viewer's browser happens to use; rectangles render pixel-identically
+# everywhere, so the face is always faithful.
+PORTRAIT_COLS = 74           # horizontal resolution of the portrait
+CELL = 5.6                   # px per pixel-cell
+BG_DROP = 0.88               # normalized-luminance above this -> transparent bg
+# Info-panel text-cell metrics.
 CHAR_W = 8.4
 CHAR_H = 16.0
 
@@ -77,29 +82,56 @@ def _gql(query: str, variables: dict) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        payload = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            payload = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        raise RuntimeError(f"HTTP {e.code} from GitHub API: {body}") from None
     if "errors" in payload:
         raise RuntimeError(payload["errors"])
     return payload["data"]
 
 
-def fetch_stats() -> dict:
-    """Return a dict of live stats, or placeholder values when no token."""
-    if not ACCESS_TOKEN:
-        return dict(
-            repos="—", contributed="—", stars="—", commits="—",
-            followers="—", following="—", uptime="live in CI",
-            year=_dt.date.today().year, live=False,
-        )
+def _placeholder_stats() -> dict:
+    return dict(
+        repos="—", contributed="—", stars="—", commits="—",
+        followers="—", following="—", uptime="live in CI",
+        year=_dt.date.today().year, live=False,
+    )
 
-    q = """
+
+def fetch_stats() -> dict:
+    """Return a dict of live stats, or placeholder values on any problem.
+
+    Prints clear diagnostics to the Action log so failures are debuggable.
+    """
+    src = ("ACCESS_TOKEN" if os.environ.get("ACCESS_TOKEN")
+           else "GH_TOKEN" if os.environ.get("GH_TOKEN")
+           else "GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN") else None)
+    print(f"[stats] user={USER_NAME}  token_source={src}  "
+          f"token_present={bool(ACCESS_TOKEN)}")
+    if not ACCESS_TOKEN:
+        print("[stats] No token in environment -> placeholder '—'. "
+              "In the workflow, ensure a token is passed as ACCESS_TOKEN "
+              "(secret) or GITHUB_TOKEN.")
+        return _placeholder_stats()
+
+    try:
+        return _fetch_stats_live()
+    except Exception as e:  # noqa: BLE001 - log & degrade, never break the run
+        print(f"[stats] API ERROR -> placeholder. Reason: {e}")
+        return _placeholder_stats()
+
+
+def _fetch_stats_live() -> dict:
+    # --- Query 1: core public stats (works with any token that reads the user)
+    q_core = """
     query($login: String!, $after: String) {
       user(login: $login) {
         createdAt
         followers { totalCount }
         following { totalCount }
-        contributionsCollection { totalCommitContributions }
         repositories(ownerAffiliations: OWNER, first: 100, after: $after) {
           totalCount
           pageInfo { hasNextPage endCursor }
@@ -109,14 +141,13 @@ def fetch_stats() -> dict:
     }
     """
     created_at = None
-    followers = following = commits = repos_total = stars = 0
+    followers = following = repos_total = stars = 0
     after = None
     while True:
-        data = _gql(q, {"login": USER_NAME, "after": after})["user"]
+        data = _gql(q_core, {"login": USER_NAME, "after": after})["user"]
         created_at = created_at or data["createdAt"]
         followers = data["followers"]["totalCount"]
         following = data["following"]["totalCount"]
-        commits = data["contributionsCollection"]["totalCommitContributions"]
         repo = data["repositories"]
         repos_total = repo["totalCount"]
         stars += sum(n["stargazerCount"] for n in repo["nodes"])
@@ -124,6 +155,18 @@ def fetch_stats() -> dict:
             after = repo["pageInfo"]["endCursor"]
         else:
             break
+
+    # --- Query 2: commits (needs read:user scope). Isolated so its failure
+    # doesn't wipe out the other stats.
+    commits_str = "—"
+    try:
+        q_c = ("query($login: String!){ user(login: $login){ "
+               "contributionsCollection{ totalCommitContributions } } }")
+        c = (_gql(q_c, {"login": USER_NAME})["user"]
+             ["contributionsCollection"]["totalCommitContributions"])
+        commits_str = f"{c:,}"
+    except Exception as e:  # noqa: BLE001
+        print(f"[stats] commits unavailable (token scope?): {e}")
 
     # account "uptime"
     start = _dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -133,9 +176,11 @@ def fetch_stats() -> dict:
     m, d = divmod(rem, 30)
     uptime = f"{y}y {m}m {d}d"
 
+    print(f"[stats] OK repos={repos_total} stars={stars} "
+          f"commits={commits_str} followers={followers} following={following}")
     return dict(
         repos=f"{repos_total}", contributed="—",
-        stars=f"{stars:,}", commits=f"{commits:,}",
+        stars=f"{stars:,}", commits=commits_str,
         followers=f"{followers}", following=f"{following}",
         uptime=uptime, year=now.year, live=True,
     )
@@ -160,14 +205,14 @@ def load_and_crop(path: str) -> Image.Image:
     return img
 
 
-def to_ascii(img: Image.Image):
-    cols = ASCII_COLS
+def to_pixels(img: Image.Image):
+    """Downsample to a grid of hex colors; None marks dropped background."""
+    cols = PORTRAIT_COLS
     w, h = img.size
-    cell_aspect = AH / AW
-    rows = max(1, int(cols * (h / w) / cell_aspect))
+    rows = max(1, round(cols * h / w))          # square cells -> no distortion
     small = img.resize((cols, rows), Image.LANCZOS)
 
-    # First pass: gather luminance so we can contrast-stretch the tonal range.
+    # Contrast-stretch luminance so the bright studio background is easy to drop.
     lums = []
     for y in range(rows):
         for x in range(cols):
@@ -177,58 +222,52 @@ def to_ascii(img: Image.Image):
     span = max(1.0, hi - lo)
 
     def boost(c):
-        return max(0, min(255, int(c * 1.2) + 30))
+        return max(0, min(255, int(c * 1.12) + 8))
 
     grid = []
     for y in range(rows):
-        line = []
+        row = []
         for x in range(cols):
             r, g, b = small.getpixel((x, y))
             lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            norm = (lum - lo) / span                 # 0 = darkest .. 1 = lightest
-            # Drop the light studio background so the portrait floats cleanly.
-            if norm > 0.85:
-                line.append((" ", "#000000"))
-                continue
-            # Invert: DARK subject/suit -> dense glyphs, LIGHT bg -> blank.
-            idx = int((1.0 - norm) * (len(RAMP) - 1))
-            ch = RAMP[idx]
-            color = f"#{boost(r):02x}{boost(g):02x}{boost(b):02x}"
-            line.append((ch, color))
-        grid.append(line)
+            norm = (lum - lo) / span
+            if norm > BG_DROP:                  # bright studio bg -> transparent
+                row.append(None)
+            else:
+                row.append(f"#{boost(r):02x}{boost(g):02x}{boost(b):02x}")
+        grid.append(row)
     return grid
 
 
-def placeholder_grid():
-    rows = int(ASCII_COLS * 0.45)
+def placeholder_pixels():
+    cols = PORTRAIT_COLS
+    rows = int(cols * 0.85)
     grid = []
     for y in range(rows):
-        line = []
-        for x in range(ASCII_COLS):
-            nx = (x - ASCII_COLS / 2) / (ASCII_COLS / 2)
+        row = []
+        for x in range(cols):
+            nx = (x - cols / 2) / (cols / 2)
             ny = (y - rows / 2) / (rows / 2)
-            ch = "#" if nx * nx + ny * ny < 0.85 else " "
-            line.append((ch, "#58a6ff"))
-        grid.append(line)
+            row.append("#3b4b66" if nx * nx + ny * ny < 0.8 else None)
+        grid.append(row)
     return grid
 
 
-def ascii_to_svg(grid, x0, y0):
+def pixels_to_svg(grid, x0, y0):
+    """Render the color grid as SVG rects (deterministic in every browser)."""
     out = []
-    row_w = ASCII_COLS * AW
-    for i, row in enumerate(grid):
-        y = y0 + i * AH
-        spans = "".join(
-            f'<tspan fill="{c}">{html.escape(ch)}</tspan>' for ch, c in row
-        )
-        # textLength locks each row to an exact width so alignment is identical
-        # regardless of which monospace font the viewer's browser substitutes.
-        out.append(
-            f'<text x="{x0:.1f}" y="{y:.1f}" class="ascii" '
-            f'textLength="{row_w:.1f}" lengthAdjust="spacingAndGlyphs">'
-            f'{spans}</text>'
-        )
-    return "\n".join(out), len(grid)
+    c = CELL
+    ov = 0.5                                     # overlap kills hairline seams
+    for y, row in enumerate(grid):
+        yy = y0 + y * c
+        for x, col in enumerate(row):
+            if col is None:
+                continue
+            out.append(
+                f'<rect x="{x0 + x * c:.2f}" y="{yy:.2f}" '
+                f'width="{c + ov:.2f}" height="{c + ov:.2f}" fill="{col}"/>'
+            )
+    return "".join(out), len(grid)
 
 
 # =============================================================================
@@ -296,24 +335,24 @@ def build_svg(theme_name, grid, stats):
     pad, title_h = 24, 40
     top = title_h + 28
 
-    ascii_x = pad + 6
-    ascii_y = top + 14
-    ascii_svg, n_rows = ascii_to_svg(grid, ascii_x, ascii_y)
-    ascii_w = ASCII_COLS * AW
-    ascii_h = n_rows * AH
+    port_x = pad + 6
+    port_y = top + 14
+    port_svg, n_rows = pixels_to_svg(grid, port_x, port_y)
+    port_w = PORTRAIT_COLS * CELL
+    port_h = n_rows * CELL
 
     lines = info_lines(stats, t["accent"], t["dim"], t["text"], t["accent2"])
     n_info = len(lines)
     info_h = n_info * CHAR_H
-    info_x = ascii_x + ascii_w + 46
-    info_y = ascii_y + max(0.0, (ascii_h - info_h) / 2)   # center vs portrait
+    info_x = port_x + port_w + 46
+    info_y = port_y + max(0.0, (port_h - info_h) / 2)   # center vs portrait
     info_svg, _ = info_to_svg(lines, info_x, info_y)
 
     max_chars = max(sum(len(s) for s, _ in segs) for segs in lines)
     info_w = max_chars * CHAR_W
 
     header_y = top - 6
-    body_bottom = ascii_y + max(ascii_h, info_h)
+    body_bottom = port_y + max(port_h, info_h)
     prompt_y = body_bottom + 26
     height = int(prompt_y + 40)
     width = max(int(info_x + info_w + pad), 900)
@@ -377,10 +416,14 @@ def build_svg(theme_name, grid, stats):
   <text x="{width/2:.0f}" y="14" text-anchor="middle" class="mono title"
         style="dominant-baseline:hanging">yorli@github: ~/profile</text>
   {header}
+  <g opacity="0">
+    <animate attributeName="opacity" from="0" to="1" dur="0.8s"
+             begin="2.8s" fill="freeze"/>
+    {port_svg}
+  </g>
   <g class="mono" opacity="0">
     <animate attributeName="opacity" from="0" to="1" dur="0.8s"
              begin="2.8s" fill="freeze"/>
-    {ascii_svg}
     {info_svg}
   </g>
   {prompt}
@@ -390,11 +433,12 @@ def build_svg(theme_name, grid, stats):
 
 def main():
     if os.path.exists(PHOTO):
-        grid = to_ascii(load_and_crop(PHOTO))
-        print(f"ASCII portrait: {ASCII_COLS}x{len(grid)} from photo.jpg")
+        grid = to_pixels(load_and_crop(PHOTO))
+        print(f"Pixel portrait: {PORTRAIT_COLS}x{len(grid)} "
+              f"from {os.path.basename(PHOTO)}")
     else:
-        grid = placeholder_grid()
-        print("photo.jpg not found - placeholder portrait. Add photo.jpg.")
+        grid = placeholder_pixels()
+        print("photo not found - placeholder portrait.")
 
     stats = fetch_stats()
     print("Stats:", "live" if stats["live"] else "placeholder", stats)

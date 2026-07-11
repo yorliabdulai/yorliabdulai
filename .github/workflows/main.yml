@@ -27,6 +27,7 @@ jobs:
       - name: Generate SVGs
         env:
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           USER_NAME: ${{ github.repository_owner }}
         run: python today.py
 
